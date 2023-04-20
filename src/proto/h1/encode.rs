@@ -44,6 +44,7 @@ enum BufKind<B> {
     Exact(B),
     Limited(Take<B>),
     Chunked(Chain<Chain<ChunkSize, B>, StaticBuf>),
+    ChunkedTrailer(Chain<Chain<Chain<StaticBuf, ChunkSize>, std::io::Cursor<Vec<u8>>>, StaticBuf>),
     ChunkedEnd(StaticBuf),
 }
 
@@ -179,6 +180,59 @@ impl Encoder {
             }
         }
     }
+
+    pub(super) fn encode_trailers<B>(&self, trailers: http::HeaderMap) -> EncodedBuf<B>
+    where
+        B: Buf,
+    {
+        match self.kind {
+            Kind::Chunked => {
+                trace!("encoding trailes");
+                let mut header_buf =
+                    Vec::with_capacity(trailers.len() * super::role::AVERAGE_HEADER_SIZE);
+
+                for (key, value) in trailers {
+                    let current_key = key.expect("current header name");
+                    // skip disallowed headers
+                    // https://datatracker.ietf.org/doc/html/rfc7230#section-4.1.2
+                    match current_key {
+                        // message framing headers
+                        http::header::TRANSFER_ENCODING
+                        | http::header::CONTENT_LENGTH
+                        // routing headers 
+                        | http::header::HOST
+                        // request modifiers
+                        | http::header::CACHE_CONTROL
+                        | http::header::MAX_FORWARDS
+                        | http::header::TE
+                        // authentication headers
+                        | http::header::AUTHORIZATION
+                        | http::header::SET_COOKIE
+                        // other headers
+                        | http::header::CONTENT_ENCODING
+                        | http::header::CONTENT_TYPE
+                        | http::header::CONTENT_RANGE
+                        | http::header::TRAILER => continue,
+                        _ => {}
+                    }
+                    header_buf.extend_from_slice(current_key.as_str().as_bytes());
+                    header_buf.extend_from_slice(b": ");
+                    header_buf.extend_from_slice(value.as_bytes());
+                    header_buf.extend_from_slice(b"\r\n");
+                }
+
+                let buf = (b"\r\n" as &'static [u8])
+                    .chain(ChunkSize::new(0))
+                    .chain(std::io::Cursor::new(header_buf))
+                    .chain(b"\r\n" as &'static [u8]);
+                let buf = EncodedBuf {
+                    kind: BufKind::ChunkedTrailer(buf),
+                };
+                buf
+            }
+            _ => unreachable!("encode_trailers_and_end called on non-chunked encoder"),
+        }
+    }
 }
 
 impl<B> Buf for EncodedBuf<B>
@@ -191,6 +245,7 @@ where
             BufKind::Exact(ref b) => b.remaining(),
             BufKind::Limited(ref b) => b.remaining(),
             BufKind::Chunked(ref b) => b.remaining(),
+            BufKind::ChunkedTrailer(ref b) => b.remaining(),
             BufKind::ChunkedEnd(ref b) => b.remaining(),
         }
     }
@@ -201,6 +256,7 @@ where
             BufKind::Exact(ref b) => b.chunk(),
             BufKind::Limited(ref b) => b.chunk(),
             BufKind::Chunked(ref b) => b.chunk(),
+            BufKind::ChunkedTrailer(ref b) => b.chunk(),
             BufKind::ChunkedEnd(ref b) => b.chunk(),
         }
     }
@@ -211,6 +267,7 @@ where
             BufKind::Exact(ref mut b) => b.advance(cnt),
             BufKind::Limited(ref mut b) => b.advance(cnt),
             BufKind::Chunked(ref mut b) => b.advance(cnt),
+            BufKind::ChunkedTrailer(ref mut b) => b.advance(cnt),
             BufKind::ChunkedEnd(ref mut b) => b.advance(cnt),
         }
     }
@@ -221,6 +278,7 @@ where
             BufKind::Exact(ref b) => b.chunks_vectored(dst),
             BufKind::Limited(ref b) => b.chunks_vectored(dst),
             BufKind::Chunked(ref b) => b.chunks_vectored(dst),
+            BufKind::ChunkedTrailer(ref b) => b.chunks_vectored(dst),
             BufKind::ChunkedEnd(ref b) => b.chunks_vectored(dst),
         }
     }
@@ -401,5 +459,21 @@ mod tests {
         assert_eq!(dst, b"foo barbaz");
         assert!(!encoder.is_eof());
         encoder.end::<()>().unwrap();
+    }
+
+    #[test]
+    fn trailers() {
+        let encoder = Encoder::chunked();
+        let mut dst = Vec::new();
+
+        let mut headers = http::HeaderMap::new();
+
+        headers.insert(http::header::ETAG, "loremipsum1".parse().unwrap());
+
+        let buf1 = encoder.encode_trailers::<Cursor<Vec<u8>>>(headers);
+        dst.put(buf1);
+        println!("{:?}", std::str::from_utf8(&dst));
+
+        assert_eq!(dst, b"\r\n0\r\netag: loremipsum1\r\n\r\n".as_ref());
     }
 }

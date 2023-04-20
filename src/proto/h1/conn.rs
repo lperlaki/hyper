@@ -660,6 +660,24 @@ where
         self.state.writing = state;
     }
 
+    pub(crate) fn write_trailers_and_end(&mut self, trailers: http::HeaderMap) {
+        debug_assert!(self.can_write_body() && self.can_buffer_body());
+        let state = match self.state.writing {
+            Writing::Body(ref encoder) => {
+                let encoded_trailers = encoder.encode_trailers(trailers);
+                self.io.buffer(encoded_trailers);
+                if encoder.is_last() {
+                    Writing::Closed
+                } else {
+                    Writing::KeepAlive
+                }
+            }
+            _ => unreachable!("write_body invalid state: {:?}", self.state.writing),
+        };
+
+        self.state.writing = state;
+    }
+
     pub(crate) fn end_body(&mut self) -> crate::Result<()> {
         debug_assert!(self.can_write_body());
 
