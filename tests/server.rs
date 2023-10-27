@@ -4,6 +4,7 @@
 use std::convert::TryInto;
 use std::future::Future;
 use std::io::{self, Read, Write};
+use std::marker::PhantomData;
 use std::net::TcpListener as StdTcpListener;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::pin::Pin;
@@ -20,6 +21,7 @@ use futures_util::future::{self, Either, FutureExt};
 use h2::client::SendRequest;
 use h2::{RecvStream, SendStream};
 use http::header::{HeaderName, HeaderValue};
+use http::HeaderMap;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full, StreamBody};
 use hyper::rt::Timer;
 use hyper::rt::{Read as AsyncRead, Write as AsyncWrite};
@@ -2595,6 +2597,44 @@ async fn http2_keep_alive_count_server_pings() {
         .expect("timed out waiting for pings");
 }
 
+#[test]
+fn http1_trailers() {
+    let foo_bar = b"foo bar baz";
+
+    let server = serve_opts().keep_alive(false).serve();
+    server
+        .reply()
+        .header("transfer-encoding", "chunked")
+        .header("trailers", "etag")
+        .body_with_trailers(
+            foo_bar,
+            Some((http::header::ETAG, HeaderValue::from_static("foobar")))
+                .into_iter()
+                .collect(),
+        );
+    let mut req = connect(server.addr());
+    req.write_all(
+        b"\
+        GET / HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        \r\n\
+    ",
+    )
+    .expect("writing 1");
+
+    let mut buf = Vec::new();
+
+    req.read_to_end(&mut buf).expect("reading 1");
+
+    assert!(buf.ends_with(
+        b"\r\nB\r\n\
+        foo bar baz\r\n\
+        \r\n0\r\n\
+        etag: foobar\r\n\
+        \r\n"
+    ));
+}
+
 // -------------------------------------------------
 // the Server that is used to run all the tests with
 // -------------------------------------------------
@@ -2697,6 +2737,49 @@ impl<'a> ReplyBuilder<'a> {
         use futures_util::TryStreamExt;
         use hyper::body::Frame;
         let body = BodyExt::boxed(StreamBody::new(stream.map_ok(Frame::data)));
+        self.tx.lock().unwrap().send(Reply::Body(body)).unwrap();
+    }
+
+    fn body_with_trailers<T: AsRef<[u8]>>(self, body: T, trailers: HeaderMap) {
+        use hyper::body::Frame;
+
+        struct BodyWithTrailer<E> {
+            data: Option<Bytes>,
+            trailers: Option<HeaderMap>,
+            _phantom: PhantomData<fn() -> E>,
+        }
+
+        impl<E> Body for BodyWithTrailer<E> {
+            type Data = Bytes;
+
+            type Error = E;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                let this = self.get_mut();
+                if let Some(body) = this.data.take() {
+                    return Poll::Ready(Some(Ok(Frame::data(body))));
+                }
+                if let Some(trailers) = this.trailers.take() {
+                    return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                }
+                Poll::Ready(None)
+            }
+
+            fn is_end_stream(&self) -> bool {
+                self.data.is_none() && self.trailers.is_none()
+            }
+        }
+
+        let chunk = Bytes::copy_from_slice(body.as_ref());
+
+        let body = BodyExt::boxed(BodyWithTrailer {
+            data: Some(chunk),
+            trailers: Some(trailers),
+            _phantom: PhantomData,
+        });
         self.tx.lock().unwrap().send(Reply::Body(body)).unwrap();
     }
 
